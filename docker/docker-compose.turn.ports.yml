@@ -1,0 +1,15 @@
+version: "3.9"
+services:
+  coturn:
+    image: instrumentisto/coturn
+    restart: unless-stopped
+    environment:
+      - TURN_SECRET=${TURN_SECRET}
+    command: ["-c", "/etc/coturn/turnserver.conf"]
+    ports:
+      - "3478:3478/udp"
+    volumes:
+      - ./infra/turn/turnserver.local.conf:/etc/coturn/turnserver.conf:ro
+      - turnlog:/var/log/turnserver
+volumes:
+  turnlog:

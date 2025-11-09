@@ -1,0 +1,16 @@
+version: "3.9"
+services:
+  coturn:
+    image: instrumentisto/coturn
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      - TURN_HOST=${TURN_HOST}
+      - TURN_REALM=${TURN_REALM}
+      - TURN_SECRET=${TURN_SECRET}
+    volumes:
+      - ./infra/turn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+      - ./infra/turn/certs:/etc/letsencrypt:ro
+      - turnlog:/var/log/turnserver
+volumes:
+  turnlog:
