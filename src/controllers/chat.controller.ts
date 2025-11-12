@@ -102,12 +102,35 @@ export async function attachFile(req: Request, res: Response) {
  */
 export async function editMsg(req: Request, res: Response) {
   try {
-    const { id } = req.params
-    const { message } = req.body
-    const userId = (req.headers['x-user-id'] as string) || (req.query.userId as string)
-    const updated = await editMessage(id, userId!, message)
-    return res.status(200).json(updated)
-  } catch (error: any) { return res.status(500).json({ message: error.message }) }
+    const { id } = req.params;
+
+    // chuẩn hóa input
+    const messageRaw = (req.body?.message ?? "").toString();
+    const message = messageRaw.trim();
+
+    const userId =
+      req.body?.senderId ||
+      req.body?.userId ||
+      req.body?.user_id ||
+      (req.headers["x-user-id"] as string) ||
+      (req.query.userId as string);
+
+    if (!id) {
+      return res.status(400).json({ status: "fail", message: "Thiếu messageId (param :id)" });
+    }
+    if (!userId) {
+      return res.status(400).json({ status: "fail", message: "Thiếu userId/senderId" });
+    }
+    if (!message) {
+      return res.status(400).json({ status: "fail", message: "Thiếu hoặc rỗng trường message" });
+    }
+
+    const updated = await editMessage(id, userId, message);
+    return res.status(200).json({ status: "success", data: updated });
+  } catch (error: any) {
+    console.error("editMsg error:", error);
+    return res.status(500).json({ status: "error", message: error.message });
+  }
 }
 
 /**
@@ -115,11 +138,28 @@ export async function editMsg(req: Request, res: Response) {
  */
 export async function deleteMsg(req: Request, res: Response) {
   try {
-    const { id } = req.params
-    const userId = (req.headers['x-user-id'] as string) || (req.query.userId as string)
-    const ok = await deleteMessage(id, userId!)
-    return res.status(200).json(ok)
-  } catch (error: any) { return res.status(500).json({ message: error.message }) }
+    const { id } = req.params;
+
+    const userId =
+      req.body?.senderId ||
+      req.body?.userId ||
+      req.body?.user_id ||
+      (req.headers["x-user-id"] as string) ||
+      (req.query.userId as string);
+
+    if (!id) {
+      return res.status(400).json({ status: "fail", message: "Thiếu messageId (param :id)" });
+    }
+    if (!userId) {
+      return res.status(400).json({ status: "fail", message: "Thiếu userId/senderId" });
+    }
+
+    const ok = await deleteMessage(id, userId);
+    return res.status(200).json({ status: "success", data: ok });
+  } catch (error: any) {
+    console.error("deleteMsg error:", error);
+    return res.status(500).json({ status: "error", message: error.message });
+  }
 }
 
 /**

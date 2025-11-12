@@ -94,7 +94,7 @@ export class MediasoupService extends EventEmitter {
       paused: false
     })
     this.consumers.set(consumer.id, consumer)
-    this.consumerToTransport.set(consumer.id, transportId)  // Track association
+    this.consumerToTransport.set(consumer.id, transportId)
     consumer.on('transportclose', () => this.closeConsumer(consumer.id))
     return consumer
   }

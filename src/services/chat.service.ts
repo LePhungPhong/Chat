@@ -1,4 +1,4 @@
-import { PrismaClient, MessageType, MessageStatus } from "@prisma/client";
+import { PrismaClient, MessageType, MessageStatus } from "../generated/prisma";
 const prisma = new PrismaClient();
 
 /**
