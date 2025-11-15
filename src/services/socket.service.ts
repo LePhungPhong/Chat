@@ -1,6 +1,6 @@
 import { Server } from "socket.io";
 import { Server as HttpServer } from "http";
-import { MediasoupService } from "../services/mediasoup.service";
+import { MediasoupService } from "./mediasoup.service";
 
 interface Peer {
   id: string;
