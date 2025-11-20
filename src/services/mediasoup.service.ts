@@ -1,6 +1,5 @@
 import { types, createWorker } from 'mediasoup'
 import { EventEmitter } from 'events'
-import type { Server as SocketServer } from 'socket.io'
 
 export class MediasoupService extends EventEmitter {
   private worker!: types.Worker
@@ -103,7 +102,6 @@ export class MediasoupService extends EventEmitter {
     const transport = this.transports.get(id)
     transport?.close()
     this.transports.delete(id)
-    // Close associated producers/consumers via maps
     this.producers.forEach((_, pid) => {
       if (this.producerToTransport.get(pid) === id) {
         this.closeProducer(pid)
@@ -120,7 +118,7 @@ export class MediasoupService extends EventEmitter {
     const producer = this.producers.get(id)
     producer?.close()
     this.producers.delete(id)
-    this.producerToTransport.delete(id)  // Clean up map
+    this.producerToTransport.delete(id)
     this.speakers.delete(id)
   }
 
@@ -140,7 +138,6 @@ export class MediasoupService extends EventEmitter {
     const active = sorted.length > 0 ? sorted[0][0] : null
     if (active) this.emit('activeSpeaker', active)
   }
-
 
   cleanupUser(transports: string[], producers: string[], consumers: string[]) {
     transports.forEach(id => this.closeTransport(id))

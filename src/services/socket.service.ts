@@ -1,185 +1,226 @@
-import { Server } from "socket.io";
+import { Server, Socket } from "socket.io";
 import { Server as HttpServer } from "http";
 import { MediasoupService } from "./mediasoup.service";
+import { PrismaClient } from "../generated/prisma";
 
-interface Peer {
-  id: string;
-  socketId: string;
-  transports: string[]; // transport ids
-  producers: string[]; // producer ids
-  consumers: string[]; // consumer ids
-  roomId?: string; // for per-room broadcasting
-}
+const prisma = new PrismaClient();
+let io: Server;
 
-const peers = new Map<string, Peer>();
-let mediasoup: MediasoupService;
+// Map lưu danh sách Producer trong từng phòng
+const roomProducers = new Map<string, { producerId: string; userId: string; kind: string }[]>();
+
+export const getIO = () => {
+  if (!io) console.warn("[Socket] IO not ready!");
+  return io;
+};
 
 export async function initSocket(server: HttpServer) {
-  const io = new Server(server, {
+  io = new Server(server, {
     path: "/socket.io",
     cors: {
-      origin: ["http://localhost:8080", "http://localhost:8081"],
+      origin: "*",
       methods: ["GET", "POST"],
       allowedHeaders: ["X-User-Id"],
-      credentials: true,
-    },
+      credentials: true
+    }
   });
 
-  // Khởi tạo mediasoup service
-  mediasoup = new MediasoupService();
+  const mediasoup = new MediasoupService();
   await mediasoup.init();
 
-  // Relay active speaker events
-  mediasoup.on("activeSpeaker", (producerId: string) => {
-    io.emit("activeSpeaker", { producerId });
-  });
+  const updatePresence = async (uid: string, status: boolean) => {
+    try {
+      await prisma.users.updateMany({
+        where: { id: uid },
+        data: { is_online: status, last_seen: new Date() }
+      });
+    } catch (e) {
+      console.error("Error updating presence:", e);
+    }
+  };
 
-  io.on("connection", (socket) => {
+  io.on("connection", async (socket: Socket) => {
     const userId = String(socket.handshake.query.userId || "");
-    if (!userId) {
+
+    if (!userId || userId === "undefined") {
       socket.disconnect(true);
       return;
     }
-    console.log(`User ${userId} connected`);
 
-    peers.set(userId, {
-      id: userId,
-      socketId: socket.id,
-      transports: [],
-      producers: [],
-      consumers: [],
+    socket.join(`user:${userId}`);
+    await updatePresence(userId, true);
+    io.emit("user-presence", {
+      userId,
+      isOnline: true,
+      lastSeen: new Date().toISOString()
     });
 
-    socket.emit("connection-success", { socketId: socket.id });
+    socket.on("join-room", (roomId) => socket.join(roomId));
+    socket.on("leave-room", (roomId) => socket.leave(roomId));
+    socket.on("typing", (data) => socket.to(data.conversationId).emit("typing", data));
 
-    socket.on("join-room", (roomId: string) => {
-      socket.join(roomId);
-      const peer = peers.get(userId);
-      if (peer) peer.roomId = roomId;
-      socket.to(roomId).emit("user-joined", { userId });
-      // Optional: Emit current participants (track qua socket rooms)
-      const roomSockets = io.sockets.adapter.rooms.get(roomId);
-      if (roomSockets) {
-        const participants = Array.from(roomSockets)
-          .map((sid) => {
-            const p = [...peers.entries()].find(
-              ([_, peer]) => peer.socketId === sid
-            );
-            return p ? p[0] : null;
-          })
-          .filter(Boolean);
-        socket.to(roomId).emit("room-participants", { participants });
-      }
-    });
-
-    socket.on("get-rtp-capabilities", (callback) => {
-      callback(mediasoup.getRtpCapabilities());
-    });
-
-    socket.on("create-transport", async (_, callback) => {
+    socket.on("mark-read", async ({ conversationId, readerId, messageIds }) => {
+      if (!Array.isArray(messageIds) || messageIds.length === 0) return;
       try {
-        const transport = await mediasoup.createTransport();
-        const params = {
-          id: transport.id,
-          iceParameters: transport.iceParameters,
-          iceCandidates: transport.iceCandidates,
-          dtlsParameters: transport.dtlsParameters,
-        };
+        await prisma.readReceipt.updateMany({
+          where: { message_id: { in: messageIds }, user_id: readerId },
+          data: { read_at: new Date() }
+        });
+        io.to(conversationId).emit("messages-read", {
+          conversationId, readerId, messageIds, readAt: new Date().toISOString()
+        });
+        const unreadCount = await prisma.readReceipt.count({
+          where: {
+            user_id: readerId, read_at: null,
+            message: { conversation_id: conversationId, status: { not: "delete" }, sender_id: { not: readerId } }
+          }
+        });
+        io.to(`user:${readerId}`).emit("conversation-updated-unread", { conversationId, unreadCount });
+      } catch (e) { console.error(e); }
+    });
 
-        const peer = peers.get(userId);
-        if (peer) peer.transports.push(transport.id);
-        callback(params);
-      } catch (error: unknown) {
-        const errMsg = error instanceof Error ? error.message : String(error);
-        callback({ error: errMsg });
+    // --- VIDEO CALL EVENTS ---
+
+    socket.on("join-video-room", async ({ roomCode, userId: uid }) => {
+      const videoRoomId = `video:${roomCode}`;
+      socket.join(videoRoomId);
+      socket.data.videoRoomCode = roomCode;
+      socket.data.userId = uid;
+
+      const producers = roomProducers.get(roomCode) || [];
+      if (producers.length > 0) {
+        socket.emit("existing-producers", producers);
       }
     });
 
-    socket.on(
-      "connect-transport",
-      async ({ transportId, dtlsParameters }, callback) => {
-        try {
-          await mediasoup.connectTransport(transportId, dtlsParameters);
-          callback("connected");
-        } catch (error: unknown) {
-          const errMsg = error instanceof Error ? error.message : String(error);
-          callback({ error: errMsg });
-        }
+    const handleLeaveVideoRoom = async () => {
+      const roomCode = socket.data.videoRoomCode;
+      const uid = socket.data.userId;
+      if (!roomCode) return;
+
+      const videoRoomId = `video:${roomCode}`;
+      socket.leave(videoRoomId);
+
+      const currentProducers = roomProducers.get(roomCode) || [];
+      const remainingProducers = currentProducers.filter(p => p.userId !== uid);
+
+      if (remainingProducers.length === 0) {
+        roomProducers.delete(roomCode);
+      } else {
+        roomProducers.set(roomCode, remainingProducers);
+        socket.to(videoRoomId).emit("peer-left", { userId: uid });
       }
-    );
 
-    socket.on(
-      "produce",
-      async ({ transportId, kind, rtpParameters, appData }, callback) => {
+      const sockets = await io.in(videoRoomId).fetchSockets();
+      if (sockets.length === 0) {
         try {
-          const producer = await mediasoup.produce(
-            transportId,
-            kind,
-            rtpParameters,
-            appData
-          );
-          const peer = peers.get(userId);
-          if (peer) peer.producers.push(producer.id);
-
-          // Thông báo tới các peer khác trong room
-          const peerRoom = peers.get(userId)?.roomId;
-          if (peerRoom) {
-            socket
-              .to(peerRoom)
-              .emit("new-producer", { producerId: producer.id, kind });
-          } else {
-            socket.broadcast.emit("new-producer", {
-              producerId: producer.id,
-              kind,
+          const room = await prisma.videoCallRoom.findFirst({ where: { room_code: roomCode, status: "active" } });
+          if (room) {
+            await prisma.videoCallRoom.update({
+              where: { id: room.id },
+              data: { status: "ended", ended_at: new Date() }
             });
+            io.to(room.conversation_id).emit("call-ended", { conversationId: room.conversation_id, roomCode });
           }
-          callback({ id: producer.id });
-        } catch (error: unknown) {
-          const errMsg = error instanceof Error ? error.message : String(error);
-          callback({ error: errMsg });
-        }
+        } catch (e) { console.error(e); }
       }
-    );
+      socket.data.videoRoomCode = null;
+    };
 
-    socket.on(
-      "consume",
-      async ({ transportId, producerId, rtpCapabilities }, callback) => {
-        try {
-          const consumer = await mediasoup.consume(
-            transportId,
-            producerId,
-            rtpCapabilities
-          );
-          const peer = peers.get(userId);
-          if (peer) peer.consumers.push(consumer.id);
+    socket.on("leave-video-room", handleLeaveVideoRoom);
 
-          callback({
-            id: consumer.id,
-            producerId,
-            kind: consumer.kind,
-            rtpParameters: consumer.rtpParameters,
-          });
-        } catch (error: unknown) {
-          const errMsg = error instanceof Error ? error.message : String(error);
-          callback({ error: errMsg });
-        }
+    // ============================================================
+    // MEDIASOUP SIGNALING (FIX LỖI CB IS NOT A FUNCTION)
+    // ============================================================
+
+    // Helper để gọi cb an toàn
+    const safeCb = (cb: any, data: any) => {
+      if (typeof cb === 'function') {
+        cb(data);
+      } else {
+        console.warn("[Socket] Client did not provide a callback for event.");
       }
-    );
+    };
 
-    socket.on("disconnect", () => {
-      console.log(`User ${userId} disconnected`);
-      const peer = peers.get(userId);
-      if (peer) {
-        // Cleanup resources
-        mediasoup.cleanupUser(peer.transports, peer.producers, peer.consumers);
-        // Notify room
-        if (peer.roomId) {
-          socket.to(peer.roomId).emit("user-left", { userId });
-        }
+    socket.on("get-rtp-capabilities", (cb) => {
+      safeCb(cb, mediasoup.getRtpCapabilities());
+    });
+
+    socket.on("create-transport", async (_, cb) => {
+      try {
+        const t = await mediasoup.createTransport();
+        safeCb(cb, {
+          id: t.id,
+          iceParameters: t.iceParameters,
+          iceCandidates: t.iceCandidates,
+          dtlsParameters: t.dtlsParameters
+        });
+      } catch (e) {
+        console.error("Create transport error:", e);
+        safeCb(cb, { error: "Cannot create transport" });
       }
-      peers.delete(userId);
+    });
+
+    socket.on("connect-transport", async ({ transportId, dtlsParameters }, cb) => {
+      try {
+        await mediasoup.connectTransport(transportId, dtlsParameters);
+        safeCb(cb, "connected");
+      } catch (e) {
+        console.error("Connect transport error:", e);
+        safeCb(cb, { error: "Connect failed" });
+      }
+    });
+
+    socket.on("produce", async ({ transportId, kind, rtpParameters, appData }, cb) => {
+      try {
+        const p = await mediasoup.produce(transportId, kind, rtpParameters, appData);
+
+        // Gọi cb trả ID cho client
+        safeCb(cb, { id: p.id });
+
+        // Logic thông báo cho người khác
+        const roomCode = socket.data.videoRoomCode;
+        if (roomCode) {
+          const producerInfo = {
+            producerId: p.id,
+            userId: socket.data.userId,
+            kind: p.kind
+          };
+          const currentProducers = roomProducers.get(roomCode) || [];
+          roomProducers.set(roomCode, [...currentProducers, producerInfo]);
+          socket.to(`video:${roomCode}`).emit("new-producer", producerInfo);
+        }
+      } catch (e) {
+        console.error("Produce error:", e);
+        safeCb(cb, { error: "Produce failed" });
+      }
+    });
+
+    socket.on("consume", async ({ transportId, producerId, rtpCapabilities }, cb) => {
+      try {
+        const c = await mediasoup.consume(transportId, producerId, rtpCapabilities);
+        safeCb(cb, {
+          id: c.id,
+          producerId,
+          kind: c.kind,
+          rtpParameters: c.rtpParameters
+        });
+      } catch (e) {
+        console.error("Consume error:", e);
+        safeCb(cb, { error: "Consume failed" });
+      }
+    });
+
+    socket.on("resume-consumer", async ({ consumerId }) => {
+      // No callback needed here usually
+    });
+
+    socket.on("disconnect", async () => {
+      await handleLeaveVideoRoom();
+      await updatePresence(userId, false);
+      io.emit("user-presence", { userId, isOnline: false, lastSeen: new Date().toISOString() });
     });
   });
 
-  console.log("Socket + Mediasoup initialized");
+  return io;
 }

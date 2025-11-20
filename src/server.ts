@@ -2,10 +2,8 @@ import http from "http";
 import app from "./app";
 import { prisma } from "./config/database";
 import { initSocket } from "./services/socket.service";
-import { Server } from 'socket.io'
 
-
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 4004;
 
 async function startServer() {
   try {
@@ -14,7 +12,10 @@ async function startServer() {
 
     const server = http.createServer(app);
 
-    await initSocket(server);
+
+    const io = await initSocket(server);
+
+    app.set("io", io);
 
     server.listen(PORT, () => {
       console.log(`🚀 Server chạy tại: http://localhost:${PORT}`);

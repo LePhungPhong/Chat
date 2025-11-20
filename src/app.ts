@@ -3,7 +3,7 @@ import cors from "cors";
 import cookieParser from "cookie-parser";
 import helmet from "helmet";
 import path from "path";
-import { corsOptions, limiter, URL_API_V1 } from "./global/settingApp";
+import { corsOptions, URL_API_V1 } from "./global/settingApp";
 import GlobalError from "./middlewares/GlobalError";
 import AppError from "./utils/error/AppError";
 import { HTTP_STATUS } from "./response/httpStatusCode";
@@ -17,7 +17,7 @@ const app: Application = express();
 // ==============================
 app.use(helmet());
 app.use(cors(corsOptions));
-app.use(limiter);
+//app.use(limiter);
 app.use(cookieParser());
 app.use(express.json({ limit: "10mb" }));
 
@@ -70,6 +70,10 @@ app.use(express.static(path.join(__dirname, "../public")));
 
 app.get("/favicon.ico", (req, res) => {
   res.status(204).end();
+});
+app.use((req: any, res, next) => {
+  req.io = req.app.get("io");
+  next();
 });
 
 // ==============================

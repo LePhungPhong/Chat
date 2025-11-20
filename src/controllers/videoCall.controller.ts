@@ -1,107 +1,54 @@
 import { Request, Response } from "express";
-import { PrismaClient } from '../generated/prisma';
+import * as service from "../services/videocall.service";
 
-import crypto from "crypto";
-
-const prisma = new PrismaClient();
-
-/**
- * Tạo phòng video call mới (1-1 hoặc nhóm)
- */
-export async function createRoom(req: Request, res: Response) {
+// ==================================================
+// 1. INITIATE CALL
+// ==================================================
+export async function initiateCall(req: Request, res: Response) {
   try {
-    const { hostId, isGroup, participantIds = [] } = req.body;
+    const { conversationId, hostId } = req.body;
+    const userId = (req.headers["x-user-id"] as string) || hostId;
 
-    if (!hostId) {
-      return res.status(400).json({ message: "Thiếu hostId" });
-    }
+    if (!conversationId) return res.status(400).json({ message: "Thiếu conversationId" });
 
+    const data = await service.initiateCallService(conversationId, hostId, userId);
+    return res.status(200).json(data);
 
-    const roomCode = crypto.randomBytes(4).toString("hex");
-
-
-    const token = crypto.randomBytes(16).toString("hex");
-
-    const room = await prisma.videoCallRoom.create({
-      data: {
-        room_code: roomCode,
-        token,
-        host_id: hostId,
-      },
-    });
-
-    return res.status(201).json({
-      message: "Tạo phòng gọi video thành công",
-      room,
-
-    });
   } catch (error: any) {
-    console.error("❌ Lỗi tạo phòng gọi:", error);
-    return res.status(500).json({ message: error.message });
+    console.error("Initiate Call Error:", error);
+    if (error.message.startsWith("FORBIDDEN")) return res.status(403).json({ message: error.message });
+    return res.status(500).json({ message: "Lỗi server" });
   }
 }
 
-/**
- * Tham gia phòng video call
- */
-export async function joinRoom(req: Request, res: Response) {
+// ==================================================
+// 2. JOIN CALL
+// ==================================================
+export async function joinCall(req: Request, res: Response) {
   try {
-    const { roomCode, userId } = req.body;
+    const { roomCode } = req.body;
+    const userId = req.headers["x-user-id"] as string;
 
-    if (!roomCode || !userId) {
-      return res.status(400).json({ message: "Thiếu roomCode hoặc userId" });
-    }
+    const data = await service.joinCallService(roomCode, userId);
+    return res.status(200).json(data);
 
-    // Kiểm tra phòng có tồn tại không
-    const room = await prisma.videoCallRoom.findUnique({
-      where: { room_code: roomCode },
-    });
-
-    if (!room) {
-      return res.status(404).json({ message: "Phòng không tồn tại" });
-    }
-
-    // Tạo token mới cho user (không check participants vì schema không hỗ trợ)
-    const token = crypto.randomBytes(16).toString("hex");
-
-    // Trả về thông tin cho client signaling (socket)
-    // Tracking participants có thể làm qua socket.join(roomCode) thay vì DB
-    return res.status(200).json({
-      message: "Tham gia phòng thành công",
-      roomCode,
-      token,
-      userId,
-    });
   } catch (error: any) {
-    console.error("❌ Lỗi tham gia phòng:", error);
-    return res.status(500).json({ message: error.message });
+    if (error.message.startsWith("NOT_FOUND")) return res.status(404).json({ message: error.message });
+    if (error.message.startsWith("FORBIDDEN")) return res.status(403).json({ message: error.message });
+    return res.status(500).json({ message: "Lỗi server" });
   }
 }
 
-/**
- * Lấy thông tin phòng (dùng để hiển thị trước khi join)
- */
+// ==================================================
+// 3. GET ROOM INFO
+// ==================================================
 export async function getRoomInfo(req: Request, res: Response) {
   try {
     const { roomCode } = req.params;
-
-    const room = await prisma.videoCallRoom.findUnique({
-      where: { room_code: roomCode },
-      include: { host: true },
-    });
-
-    if (!room) {
-      return res.status(404).json({ message: "Phòng không tồn tại" });
-    }
-
-    return res.status(200).json({
-      roomCode: room.room_code,
-      host: room.host,
-      created_at: room.created_at,
-      status: "active",  // Hardcode vì schema không có ended_at
-    });
+    const data = await service.getRoomInfoService(roomCode);
+    return res.status(200).json(data);
   } catch (error: any) {
-    console.error("❌ Lỗi lấy thông tin phòng:", error);
-    return res.status(500).json({ message: error.message });
+    if (error.message.startsWith("NOT_FOUND")) return res.status(404).json({ message: error.message });
+    return res.status(500).json({ message: "Internal Error" });
   }
 }
