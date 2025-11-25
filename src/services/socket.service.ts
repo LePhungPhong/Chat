@@ -62,17 +62,33 @@ export async function initSocket(server: HttpServer) {
     socket.on("mark-read", async ({ conversationId, readerId, messageIds }) => {
       if (!Array.isArray(messageIds) || messageIds.length === 0) return;
       try {
+        // [FIX] Update logic: chỉ đánh dấu tin nhắn KHÔNG phải của mình
         await prisma.readReceipt.updateMany({
-          where: { message_id: { in: messageIds }, user_id: readerId },
+          where: {
+            message_id: { in: messageIds },
+            user_id: readerId,
+            message: {
+              sender_id: { not: readerId }
+            }
+          },
           data: { read_at: new Date() }
         });
+
+        // Báo cho client là đã update xong
         io.to(conversationId).emit("messages-read", {
           conversationId, readerId, messageIds, readAt: new Date().toISOString()
         });
+
+        // [FIX] Tính lại unread: Loại bỏ tin nhắn của chính mình
         const unreadCount = await prisma.readReceipt.count({
           where: {
-            user_id: readerId, read_at: null,
-            message: { conversation_id: conversationId, status: { not: "delete" }, sender_id: { not: readerId } }
+            user_id: readerId,
+            read_at: null,
+            message: {
+              conversation_id: conversationId,
+              status: { not: "delete" },
+              sender_id: { not: readerId } // Quan trọng
+            }
           }
         });
         io.to(`user:${readerId}`).emit("conversation-updated-unread", { conversationId, unreadCount });
@@ -130,10 +146,9 @@ export async function initSocket(server: HttpServer) {
     socket.on("leave-video-room", handleLeaveVideoRoom);
 
     // ============================================================
-    // MEDIASOUP SIGNALING (FIX LỖI CB IS NOT A FUNCTION)
+    // MEDIASOUP SIGNALING
     // ============================================================
 
-    // Helper để gọi cb an toàn
     const safeCb = (cb: any, data: any) => {
       if (typeof cb === 'function') {
         cb(data);
@@ -175,10 +190,8 @@ export async function initSocket(server: HttpServer) {
       try {
         const p = await mediasoup.produce(transportId, kind, rtpParameters, appData);
 
-        // Gọi cb trả ID cho client
         safeCb(cb, { id: p.id });
 
-        // Logic thông báo cho người khác
         const roomCode = socket.data.videoRoomCode;
         if (roomCode) {
           const producerInfo = {
