@@ -4,7 +4,7 @@ import { getIO } from "./socket.service";
 const prisma = new PrismaClient();
 
 // ============================================================
-// Hàm thông báo Sidebar chuẩn xác logic joined_at
+// Hàm thông báo Sidebar (Đã sửa logic đếm unread)
 // ============================================================
 const notifySidebar = async (conversationId: string) => {
   try {
@@ -30,16 +30,18 @@ const notifySidebar = async (conversationId: string) => {
       ? (last.created_at as unknown as Date).toISOString()
       : new Date().toISOString();
 
-    // 2. Lấy danh sách thành viên để tính badge riêng cho từng người
+    // 2. Lấy danh sách thành viên
     const members = await prisma.conversationMember.findMany({
       where: { conversation_id: conversationId },
-      select: { user_id: true, joined_at: true }, // <--- BẮT BUỘC có joined_at
+      select: { user_id: true, joined_at: true },
     });
 
-    // 3. Loop từng người để tính số tin chưa đọc của riêng họ
+    // 3. Loop từng người để tính số tin chưa đọc
     for (const m of members) {
-      // Mốc thời gian user này bắt đầu thấy tin nhắn (do xóa lịch sử hoặc mới vào nhóm)
       const joinedAt = m.joined_at ? new Date(m.joined_at) : new Date(0);
+
+      // [QUAN TRỌNG] Ép kiểu String để socket room chính xác
+      const userIdStr = String(m.user_id);
 
       const unreadCount = await prisma.readReceipt.count({
         where: {
@@ -47,16 +49,15 @@ const notifySidebar = async (conversationId: string) => {
           read_at: null, // Chưa đọc
           message: {
             conversation_id: conversationId,
-            sender_id: { not: m.user_id }, // Không đếm tin mình gửi
-            //  Không đếm tin đã xóa HOẶC thu hồi
+            // [FIX] Không đếm tin nhắn do chính user này gửi
+            sender_id: { not: m.user_id },
             status: { notIn: ["delete", "recall"] },
-            //  Chỉ đếm tin nhắn mới hơn thời điểm join/reset
             created_at: { gte: joinedAt },
           },
         },
       });
 
-      io.to(`user:${m.user_id}`).emit("conversation-updated", {
+      io.to(`user:${userIdStr}`).emit("conversation-updated", {
         conversationId,
         lastMessage,
         lastMessageAt,
@@ -68,7 +69,9 @@ const notifySidebar = async (conversationId: string) => {
   }
 };
 
-
+// ============================================================
+// Gửi tin nhắn (Đã sửa logic tạo ReadReceipt)
+// ============================================================
 export async function sendMessage(
   conversationId: string,
   senderId: string,
@@ -101,11 +104,15 @@ export async function sendMessage(
   });
 
   // Tạo ReadReceipt cho tất cả thành viên
-  const receipts = members.map((m) => ({
-    message_id: msg.id,
-    user_id: m.user_id,
-    read_at: m.user_id === senderId ? new Date() : null,
-  }));
+  const receipts = members.map((m) => {
+    // [FIX] So sánh String để đảm bảo người gửi luôn được đánh dấu là ĐÃ ĐỌC
+    const isSender = String(m.user_id) === String(senderId);
+    return {
+      message_id: msg.id,
+      user_id: m.user_id,
+      read_at: isSender ? new Date() : null,
+    };
+  });
 
   await prisma.readReceipt.createMany({ data: receipts });
 
@@ -147,7 +154,8 @@ export async function sendMessage(
 
 export async function deleteMessage(id: string, userId: string) {
   const existing = await prisma.message.findUnique({ where: { id } });
-  if (!existing || existing.sender_id !== userId)
+  // Ép kiểu String khi so sánh quyền sở hữu
+  if (!existing || String(existing.sender_id) !== String(userId))
     throw new Error("Unauthorized");
 
   const msg = await prisma.message.update({
@@ -169,7 +177,7 @@ export async function deleteMessage(id: string, userId: string) {
 }
 
 // ============================================================
-// [CORE FIX] Lọc list chat theo joined_at
+// Lấy danh sách Chat (Đã sửa logic đếm unread)
 // ============================================================
 export async function getUserConversations(userId: string) {
   const list = await prisma.conversation.findMany({
@@ -201,7 +209,8 @@ export async function getUserConversations(userId: string) {
   // Xử lý logic ẩn chat đã xóa + đếm unread
   const processed = await Promise.all(
     list.map(async (c) => {
-      const me = c.members.find((m) => m.user_id === userId);
+      // Tìm member object của chính user đang request (userId)
+      const me = c.members.find((m) => String(m.user_id) === String(userId));
       const joinedAt = me?.joined_at ? new Date(me.joined_at) : new Date(0);
 
       const last = c.messages[0];
@@ -211,14 +220,17 @@ export async function getUserConversations(userId: string) {
         return null;
       }
 
+      // [FIX] Đếm số tin nhắn chưa đọc
       const unread = await prisma.readReceipt.count({
         where: {
           user_id: userId,
           read_at: null,
           message: {
             conversation_id: c.id,
-            status: { notIn: ["delete", "recall"] }, // Không đếm tin thu hồi
-            created_at: { gte: joinedAt }, // Chỉ đếm tin mới
+            // [FIX] BẮT BUỘC: Không đếm tin do chính userId gửi
+            sender_id: { not: userId },
+            status: { notIn: ["delete", "recall"] },
+            created_at: { gte: joinedAt },
           },
         },
       });
@@ -240,7 +252,7 @@ export async function getUserConversations(userId: string) {
 
 export async function getMessages(
   conversationId: string,
-  userId: string, // Cần userId để biết mốc thời gian
+  userId: string,
   cursor?: string,
   limit = 30
 ) {
@@ -262,7 +274,7 @@ export async function getMessages(
   const where: any = {
     conversation_id: conversationId,
     status: { not: "delete" },
-    created_at: { gte: cutoffDate }, // Chỉ lấy tin nhắn SAU khi join/reset
+    created_at: { gte: cutoffDate },
   };
 
   if (cursor) {
@@ -284,9 +296,6 @@ export async function getMessages(
   return rows.reverse();
 }
 
-// ============================================================
-// Soft Delete: Reset joined_at thành NOW
-// ============================================================
 export async function softDeleteConversation(
   conversationId: string,
   userId: string
@@ -311,7 +320,6 @@ export async function softDeleteConversation(
   return { success: true };
 }
 
-// ... (Giữ nguyên createGroupConversation, ensureRoom, setRead, addAttachment, editMessage, searchMessages, setTyping, addMembers, removeMember, leaveGroup, transferOwnership, disbandGroup)
 export async function createGroupConversation(
   name: string,
   createdBy: string,
@@ -327,7 +335,7 @@ export async function createGroupConversation(
       members: {
         create: uniqueIds.map((id) => ({
           user_id: id,
-          role: id === createdBy ? "admin" : "member",
+          role: String(id) === String(createdBy) ? "admin" : "member",
         })),
       },
     },
@@ -347,6 +355,7 @@ export async function createGroupConversation(
   }
   return newGroup;
 }
+
 export async function ensureRoom(userAId: string, userBId: string) {
   const conversation = await prisma.conversation.findFirst({
     where: {
@@ -387,18 +396,26 @@ export async function ensureRoom(userAId: string, userBId: string) {
   }
   return newRoom;
 }
+
 export async function setRead(messageId: string, userId: string) {
   await prisma.readReceipt.updateMany({
     where: { message_id: messageId, user_id: userId },
     data: { read_at: new Date() },
   });
 }
+
+// [FIX] Mark All As Read - Sửa logic
 export async function markAllAsRead(conversationId: string, userId: string) {
   await prisma.readReceipt.updateMany({
     where: {
       user_id: userId,
       read_at: null,
-      message: { conversation_id: conversationId, status: { not: "delete" } },
+      message: {
+        conversation_id: conversationId,
+        status: { not: "delete" },
+        // [FIX] Chỉ đánh dấu các tin của NGƯỜI KHÁC
+        sender_id: { not: userId }
+      },
     },
     data: { read_at: new Date() },
   });
@@ -411,16 +428,19 @@ export async function markAllAsRead(conversationId: string, userId: string) {
   }
   return { success: true };
 }
+
 export async function addAttachment(mId: string, url: string, type: any) {
   return prisma.attachment.create({
     data: { message_id: mId, file_url: url, file_type: type },
   });
 }
+
 export async function editMessage(id: string, uid: string, text: string) {
   const m = await prisma.message.findUnique({ where: { id } });
-  if (m?.sender_id !== uid) throw new Error("Unauthorized");
+  if (String(m?.sender_id) !== String(uid)) throw new Error("Unauthorized");
   return prisma.message.update({ where: { id }, data: { message: text } });
 }
+
 export async function searchMessages(cid: string, q: string) {
   return prisma.message.findMany({
     where: {
@@ -430,6 +450,7 @@ export async function searchMessages(cid: string, q: string) {
     },
   });
 }
+
 export async function setTyping(cid: string, uid: string, typing: boolean) {
   return prisma.typingStatus.upsert({
     where: { conversation_id_user_id: { conversation_id: cid, user_id: uid } },
@@ -437,8 +458,8 @@ export async function setTyping(cid: string, uid: string, typing: boolean) {
     update: { is_typing: typing },
   });
 }
+
 export async function addMembers(cid: string, ids: string[]) {
-  // 1. Thêm vào DB với joined_at = NOW
   await prisma.conversationMember.createMany({
     data: ids.map(id => ({ conversation_id: cid, user_id: id, joined_at: new Date() })),
     skipDuplicates: true
@@ -446,31 +467,27 @@ export async function addMembers(cid: string, ids: string[]) {
 
   const io = getIO();
   if (io) {
-    // 2. Báo cho thành viên CŨ (để update list member bên phải)
     const newMembers = await prisma.users.findMany({
       where: { id: { in: ids } },
       select: { id: true, fullname: true, username: true, avatarUrl: true, is_online: true, last_seen: true }
     });
     io.to(cid).emit("members-added", { conversationId: cid, members: newMembers });
 
-    // 3. Báo cho thành viên MỚI (để hiện nhóm bên trái)
     const fullConversation = await prisma.conversation.findUnique({
       where: { id: cid },
       include: {
         members: {
           include: { user: { select: { id: true, fullname: true, username: true, avatarUrl: true, is_online: true, last_seen: true } } }
         },
-        // Vẫn lấy tin nhắn để đảm bảo cấu trúc, nhưng sẽ override bên dưới
         messages: { take: 1, orderBy: { created_at: "desc" } }
       }
     });
 
     if (fullConversation) {
-      // [QUAN TRỌNG] Ghi đè last_message thành rỗng để người mới thấy "Chưa có tin nhắn"
       const payloadForNewMember = {
         ...fullConversation,
-        last_message: "", // <--- Hiển thị rỗng
-        last_message_at: new Date(), // Thời gian hiện tại
+        last_message: "",
+        last_message_at: new Date(),
         unread_count: 0
       };
 
@@ -479,7 +496,6 @@ export async function addMembers(cid: string, ids: string[]) {
       });
     }
 
-    // 4. Gửi tin nhắn hệ thống (Optional)
     const names = newMembers.map(u => u.fullname || u.username).join(", ");
     io.to(cid).emit("new-message", {
       id: Math.random().toString(),
@@ -493,20 +509,18 @@ export async function addMembers(cid: string, ids: string[]) {
   }
   return { success: true };
 }
+
 export async function removeMember(cid: string, uid: string) {
-  // 1. Lấy thông tin user trước khi xóa để có Tên hiển thị
   const user = await prisma.users.findUnique({
     where: { id: uid },
     select: { fullname: true, username: true }
   });
   const name = user?.fullname || user?.username || "Thành viên";
 
-  // 2. Xóa thành viên khỏi nhóm trong DB
   await prisma.conversationMember.deleteMany({
     where: { conversation_id: cid, user_id: uid }
   });
 
-  // 3. Lưu tin nhắn hệ thống vào DB
   const systemMsg = await prisma.message.create({
     data: {
       conversation_id: cid,
@@ -520,13 +534,8 @@ export async function removeMember(cid: string, uid: string) {
 
   const io = getIO();
   if (io) {
-    // Event A: Báo cho người bị kick (để xóa Sidebar của họ ngay lập tức)
     io.to(`user:${uid}`).emit("conversation-removed", { conversationId: cid });
-
-    // Event B: Báo cho nhóm (để cập nhật danh sách thành viên bên phải)
     io.to(cid).emit("member-removed", { conversationId: cid, userId: uid });
-
-    // Event C: Báo tin nhắn mới cho nhóm (để hiển thị dòng thông báo)
     io.to(cid).emit("new-message", {
       ...systemMsg,
       sender: {
@@ -540,6 +549,7 @@ export async function removeMember(cid: string, uid: string) {
 
   return { success: true };
 }
+
 export async function leaveGroup(cid: string, uid: string) {
   await prisma.conversationMember.deleteMany({
     where: { conversation_id: cid, user_id: uid },
@@ -550,6 +560,7 @@ export async function leaveGroup(cid: string, uid: string) {
   }
   return { success: true };
 }
+
 export async function transferOwnership(
   cid: string,
   currentAdminId: string,
@@ -560,7 +571,7 @@ export async function transferOwnership(
     include: { members: true },
   });
   const isAdmin =
-    conv?.members.find((m) => m.user_id === currentAdminId)?.role === "admin";
+    conv?.members.find((m) => String(m.user_id) === String(currentAdminId))?.role === "admin";
   if (!isAdmin) throw new Error("Bạn không phải quản trị viên");
   await prisma.$transaction([
     prisma.conversationMember.updateMany({
@@ -595,6 +606,7 @@ export async function transferOwnership(
   }
   return { success: true };
 }
+
 export async function disbandGroup(cid: string, adminId: string) {
   const member = await prisma.conversationMember.findUnique({
     where: { conversation_id_user_id: { conversation_id: cid, user_id: adminId } }
@@ -606,7 +618,6 @@ export async function disbandGroup(cid: string, adminId: string) {
     io.to(cid).emit("conversation-removed", { conversationId: cid });
   }
 
-  // Xóa ReadReceipts trước
   const messages = await prisma.message.findMany({ where: { conversation_id: cid }, select: { id: true } });
   const messageIds = messages.map(m => m.id);
 
@@ -615,13 +626,11 @@ export async function disbandGroup(cid: string, adminId: string) {
     await prisma.attachment.deleteMany({ where: { message_id: { in: messageIds } } });
   }
 
-  // Sau đó mới xóa Conversation (Prisma sẽ cascade members và messages)
   await prisma.conversation.delete({ where: { id: cid } });
-
   return { success: true };
 }
+
 export async function renameGroup(conversationId: string, userId: string, newName: string) {
-  // 1. Kiểm tra quyền admin
   const member = await prisma.conversationMember.findUnique({
     where: {
       conversation_id_user_id: {
@@ -635,20 +644,17 @@ export async function renameGroup(conversationId: string, userId: string, newNam
     throw new Error("UNAUTHORIZED: Chỉ quản trị viên mới có thể đổi tên nhóm.");
   }
 
-  // 2. Update DB
   const updatedConv = await prisma.conversation.update({
     where: { id: conversationId },
     data: { name: newName }
   });
 
-  // 3. Gửi thông báo và Socket
   const io = getIO();
   if (io) {
     const user = await prisma.users.findUnique({ where: { id: userId } });
     const userName = user?.fullname || user?.username || "Admin";
     const message = `${userName} đã đổi tên nhóm thành "${newName}".`;
 
-    // Tạo tin nhắn hệ thống
     const systemMsg = await prisma.message.create({
       data: {
         conversation_id: conversationId,
@@ -665,13 +671,11 @@ export async function renameGroup(conversationId: string, userId: string, newNam
       }
     });
 
-    // Event A: Báo tin nhắn mới cho nhóm
     io.to(conversationId).emit("new-message", {
       ...systemMsg,
       createdAt: systemMsg.created_at,
     });
 
-    // Event B1: Báo cho tất cả client ĐANG ở trong phòng hội thoại
     io.to(conversationId).emit("conversation-updated", {
       conversationId,
       newName,
@@ -679,7 +683,6 @@ export async function renameGroup(conversationId: string, userId: string, newNam
       lastMessageAt: systemMsg.created_at,
     });
 
-    // vent B2: Báo cho tất cả user (Sidebar) qua room `user:{id}`
     const members = await prisma.conversationMember.findMany({
       where: { conversation_id: conversationId },
       select: { user_id: true },
@@ -691,8 +694,6 @@ export async function renameGroup(conversationId: string, userId: string, newNam
         newName,
         lastMessage: message,
         lastMessageAt: systemMsg.created_at,
-        // không gửi unreadCount → Aside giữ nguyên unread cũ,
-        // rename không bị tính là "tin nhắn chưa đọc"
       });
     }
   }
