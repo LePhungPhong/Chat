@@ -12,13 +12,12 @@ async function startServer() {
 
     const server = http.createServer(app);
 
-
     const io = await initSocket(server);
 
     app.set("io", io);
 
     server.listen(PORT, () => {
-      console.log(`🚀 Server chạy tại: http://localhost:${PORT}`);
+      console.log(`🚀 Server chạy tại: https://localhost:${PORT}`);
     });
   } catch (error) {
     console.error("❌ Lỗi khởi động server:", error);
