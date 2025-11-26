@@ -24,6 +24,7 @@
     "jsonwebtoken": "^9.0.2",
     "mediasoup": "^3.19.3",
     "mediasoup-client": "^3.18.0",
+    "nats": "^2.29.3",
     "sdp-transform": "2.15.0",
     "socket.io": "^4.8.1",
     "uuid": "^11.1.0"

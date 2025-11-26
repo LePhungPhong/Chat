@@ -2,6 +2,7 @@ import http from "http";
 import app from "./app";
 import { prisma } from "./config/database";
 import { initSocket } from "./services/socket.service";
+import { startAllListeners } from "./services/listen.service";
 
 const PORT = process.env.PORT || 4004;
 
@@ -16,7 +17,8 @@ async function startServer() {
 
     app.set("io", io);
 
-    server.listen(PORT, () => {
+    server.listen(PORT, async () => {
+      await startAllListeners();
       console.log(`🚀 Server chạy tại: https://localhost:${PORT}`);
     });
   } catch (error) {
