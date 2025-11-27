@@ -6,7 +6,7 @@ import { PrismaClient } from "../generated/prisma";
 const prisma = new PrismaClient();
 let io: Server;
 
-// Map lưu danh sách Producer trong từng phòng
+// Map lưu danh sách Producer trong từng phòng video
 const roomProducers = new Map<
   string,
   { producerId: string; userId: string; kind: string }[]
@@ -31,6 +31,7 @@ export async function initSocket(server: HttpServer) {
   const mediasoup = new MediasoupService();
   await mediasoup.init();
 
+  // Helper cập nhật DB
   const updatePresence = async (uid: string, status: boolean) => {
     try {
       await prisma.users.updateMany({
@@ -38,28 +39,65 @@ export async function initSocket(server: HttpServer) {
         data: { is_online: status, last_seen: new Date() },
       });
     } catch (e) {
-      console.error("Error updating presence:", e);
+      console.error(`Error updating presence for ${uid}:`, e);
     }
   };
 
   io.on("connection", async (socket: Socket) => {
     const userId = String(socket.handshake.query.userId || "");
 
+    // Validate User
     if (!userId || userId === "undefined") {
+      console.log("[Socket] Invalid userId, disconnecting...");
       socket.disconnect(true);
       return;
     }
 
-    socket.join(`user:${userId}`);
+    // Room riêng quản lý connection của User này (để xử lý đa tab)
+    const userRoom = `user:${userId}`;
+    socket.join(userRoom);
+
+    // ============================================================
+    // 1. LOGIC ONLINE / PRESENCE (ĐÃ SỬA LỖI)
+    // ============================================================
+
+    // Bước 1: Cập nhật DB ngay lập tức
     await updatePresence(userId, true);
-    io.emit("user-presence", {
+    const now = new Date().toISOString();
+
+    // Bước 2: Báo cho NGƯỜI KHÁC biết user này vừa online
+    // Dùng broadcast để không gửi ngược lại cho chính user này (tránh duplicate state ở FE)
+    socket.broadcast.emit("user-presence", {
       userId,
       isOnline: true,
-      lastSeen: new Date().toISOString(),
+      lastSeen: now,
     });
 
+    // Bước 3: Gửi danh sách online hiện có cho user vừa vào
+    try {
+      const onlineUsers = await prisma.users.findMany({
+        where: { is_online: true },
+        select: { id: true, last_seen: true },
+      });
+
+      socket.emit(
+        "presence-init",
+        onlineUsers.map((u: any) => ({
+          userId: u.id,
+          isOnline: true,
+          lastSeen: u.last_seen,
+        }))
+      );
+    } catch (e) {
+      console.error("Error loading online users:", e);
+    }
+
+    // ============================================================
+    // 2. LOGIC CHAT (MESSAGING)
+    // ============================================================
     socket.on("join-room", (roomId) => socket.join(roomId));
     socket.on("leave-room", (roomId) => socket.leave(roomId));
+
     socket.on("typing", (data) =>
       socket.to(data.conversationId).emit("typing", data)
     );
@@ -67,19 +105,16 @@ export async function initSocket(server: HttpServer) {
     socket.on("mark-read", async ({ conversationId, readerId, messageIds }) => {
       if (!Array.isArray(messageIds) || messageIds.length === 0) return;
       try {
-        // [FIX] Update logic: chỉ đánh dấu tin nhắn KHÔNG phải của mình
+        // Chỉ đánh dấu tin nhắn của người khác gửi
         await prisma.readReceipt.updateMany({
           where: {
             message_id: { in: messageIds },
             user_id: readerId,
-            message: {
-              sender_id: { not: readerId },
-            },
+            message: { sender_id: { not: readerId } },
           },
           data: { read_at: new Date() },
         });
 
-        // Báo cho client là đã update xong
         io.to(conversationId).emit("messages-read", {
           conversationId,
           readerId,
@@ -87,7 +122,7 @@ export async function initSocket(server: HttpServer) {
           readAt: new Date().toISOString(),
         });
 
-        // [FIX] Tính lại unread: Loại bỏ tin nhắn của chính mình
+        // Tính lại unread count
         const unreadCount = await prisma.readReceipt.count({
           where: {
             user_id: readerId,
@@ -95,20 +130,72 @@ export async function initSocket(server: HttpServer) {
             message: {
               conversation_id: conversationId,
               status: { not: "delete" },
-              sender_id: { not: readerId }, // Quan trọng
+              sender_id: { not: readerId },
             },
           },
         });
+
         io.to(`user:${readerId}`).emit("conversation-updated-unread", {
           conversationId,
           unreadCount,
         });
       } catch (e) {
-        console.error(e);
+        console.error("Mark read error:", e);
       }
     });
 
-    // --- VIDEO CALL EVENTS ---
+    // ============================================================
+    // 3. LOGIC VIDEO CALL
+    // ============================================================
+
+    // Hàm xử lý rời phòng video (được dùng cả khi user chủ động rời và khi disconnect)
+    const handleLeaveVideoRoom = async () => {
+      const roomCode = socket.data.videoRoomCode as string | undefined;
+      const uid = socket.data.userId as string | undefined;
+
+      if (!roomCode) return;
+
+      const videoRoomId = `video:${roomCode}`;
+      socket.leave(videoRoomId);
+
+      // Cập nhật danh sách producers trong RAM
+      const currentProducers = roomProducers.get(roomCode) || [];
+      const remainingProducers = currentProducers.filter(
+        (p) => p.userId !== uid
+      );
+
+      if (remainingProducers.length === 0) {
+        roomProducers.delete(roomCode);
+      } else {
+        roomProducers.set(roomCode, remainingProducers);
+        // Báo cho những người còn lại trong phòng video
+        socket.to(videoRoomId).emit("peer-left", { userId: uid });
+      }
+
+      // Kiểm tra xem phòng video còn ai không
+      const socketsInVideo = await io.in(videoRoomId).fetchSockets();
+      if (socketsInVideo.length === 0) {
+        try {
+          const room = await prisma.videoCallRoom.findFirst({
+            where: { room_code: roomCode, status: "active" },
+          });
+          if (room) {
+            await prisma.videoCallRoom.update({
+              where: { id: room.id },
+              data: { status: "ended", ended_at: new Date() },
+            });
+            // Báo cuộc gọi kết thúc cho conversation chat
+            io.to(room.conversation_id).emit("call-ended", {
+              conversationId: room.conversation_id,
+              roomCode,
+            });
+          }
+        } catch (e) {
+          console.error("Error closing video room:", e);
+        }
+      }
+      socket.data.videoRoomCode = null;
+    };
 
     socket.on("join-video-room", async ({ roomCode, userId: uid }) => {
       const videoRoomId = `video:${roomCode}`;
@@ -122,61 +209,11 @@ export async function initSocket(server: HttpServer) {
       }
     });
 
-    const handleLeaveVideoRoom = async () => {
-      const roomCode = socket.data.videoRoomCode;
-      const uid = socket.data.userId;
-      if (!roomCode) return;
-
-      const videoRoomId = `video:${roomCode}`;
-      socket.leave(videoRoomId);
-
-      const currentProducers = roomProducers.get(roomCode) || [];
-      const remainingProducers = currentProducers.filter(
-        (p) => p.userId !== uid
-      );
-
-      if (remainingProducers.length === 0) {
-        roomProducers.delete(roomCode);
-      } else {
-        roomProducers.set(roomCode, remainingProducers);
-        socket.to(videoRoomId).emit("peer-left", { userId: uid });
-      }
-
-      const sockets = await io.in(videoRoomId).fetchSockets();
-      if (sockets.length === 0) {
-        try {
-          const room = await prisma.videoCallRoom.findFirst({
-            where: { room_code: roomCode, status: "active" },
-          });
-          if (room) {
-            await prisma.videoCallRoom.update({
-              where: { id: room.id },
-              data: { status: "ended", ended_at: new Date() },
-            });
-            io.to(room.conversation_id).emit("call-ended", {
-              conversationId: room.conversation_id,
-              roomCode,
-            });
-          }
-        } catch (e) {
-          console.error(e);
-        }
-      }
-      socket.data.videoRoomCode = null;
-    };
-
     socket.on("leave-video-room", handleLeaveVideoRoom);
 
-    // ============================================================
-    // MEDIASOUP SIGNALING
-    // ============================================================
-
+    // --- MEDIASOUP SIGNALING ---
     const safeCb = (cb: any, data: any) => {
-      if (typeof cb === "function") {
-        cb(data);
-      } else {
-        console.warn("[Socket] Client did not provide a callback for event.");
-      }
+      if (typeof cb === "function") cb(data);
     };
 
     socket.on("get-rtp-capabilities", (cb) => {
@@ -221,7 +258,6 @@ export async function initSocket(server: HttpServer) {
             rtpParameters,
             appData
           );
-
           safeCb(cb, { id: p.id });
 
           const roomCode = socket.data.videoRoomCode;
@@ -231,8 +267,8 @@ export async function initSocket(server: HttpServer) {
               userId: socket.data.userId,
               kind: p.kind,
             };
-            const currentProducers = roomProducers.get(roomCode) || [];
-            roomProducers.set(roomCode, [...currentProducers, producerInfo]);
+            const current = roomProducers.get(roomCode) || [];
+            roomProducers.set(roomCode, [...current, producerInfo]);
             socket.to(`video:${roomCode}`).emit("new-producer", producerInfo);
           }
         } catch (e) {
@@ -265,17 +301,28 @@ export async function initSocket(server: HttpServer) {
     );
 
     socket.on("resume-consumer", async ({ consumerId }) => {
-      // No callback needed here usually
+      // Logic resume nếu cần thiết
     });
 
+    // ============================================================
+    // 4. DISCONNECT
+    // ============================================================
     socket.on("disconnect", async () => {
+      // 1. Xử lý rời video room trước
       await handleLeaveVideoRoom();
-      await updatePresence(userId, false);
-      io.emit("user-presence", {
-        userId,
-        isOnline: false,
-        lastSeen: new Date().toISOString(),
-      });
+      const remainingSockets = await io.in(userRoom).fetchSockets();
+
+      if (remainingSockets.length === 0) {
+        // Chỉ khi KHÔNG còn socket nào kết nối thì mới tính là Offline
+        await updatePresence(userId, false);
+
+        io.emit("user-presence", {
+          userId,
+          isOnline: false,
+          lastSeen: new Date().toISOString(),
+        });
+      } else {
+      }
     });
   });
 
